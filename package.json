@@ -1,0 +1,26 @@
+{
+  "name": "vorel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node backend/index.js",
+    "demo": "node demo/server.js",
+    "build-db": "node backend/scripts/build-db.js",
+    "enrich": "node pipeline/enricher.js",
+    "tag": "node pipeline/tagger.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.89.0",
+    "@supabase/supabase-js": "^2.49.4",
+    "better-sqlite3": "^12.9.0",
+    "csv-parse": "^6.2.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "openai": "^4.98.0",
+    "youtube-transcript": "^1.2.1"
+  }
+}

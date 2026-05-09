@@ -1,0 +1,18 @@
+node_modules/
+.env
+.env.example
+.env.local
+.DS_Store
+npm-debug.log*
+
+# Build output
+frontend/.next/
+frontend/out/
+
+# Local data
+frontend/.data/
+backend/users/
+backend/*.db
+
+# IDE / tooling
+.claude/
