@@ -1,0 +1,47 @@
+{
+  "name": "Adnan",
+  "onboarded": false,
+  "conversation": [
+    {
+      "role": "assistant",
+      "content": "Hey Adnan! What have you got in the kitchen today?"
+    },
+    {
+      "role": "user",
+      "content": "Rice, Paneer & some veggies"
+    },
+    {
+      "role": "assistant",
+      "content": "What's your time situation — got 30 minutes or more like an hour?"
+    },
+    {
+      "role": "user",
+      "content": "30mins, something easy and quick tonight "
+    },
+    {
+      "role": "assistant",
+      "content": "Here are 3 quick dishes for you:\n\n1. Thecha Paneer Rice — quick — Paneer with a spicy thecha twist, ready in 30 mins\nhttps://www.youtube.com/watch?v=n2kZQzd-c-U · 365k views\n\n2. Spinach Rice with Paneer — ? — Classic comfort with paneer and greens, minimal fuss\nhttps://www.youtube.com/watch?v=Gks-ImnftEE · 723k views\n\n3. Chilli Garlic Paneer Sandwich — quick — If you want something different, crispy paneer between bread\nhttps://www.youtube.com/watch?v=6pXJCPRLn3A · 474k views\n\nWhich one sounds good?"
+    },
+    {
+      "role": "user",
+      "content": "What should I make now? I have cooked Tandoori Chicken in the fridge already"
+    },
+    {
+      "role": "assistant",
+      "content": "Got it — with tandoori chicken already done, let me suggest dishes that use it:\n\n1. Tandoori Chicken Fried Rice — 15 mins — Shred that chicken, toss with rice and veggies, done\nhttps://www.youtube.com/watch?v=dQw4w9WgXcQ · 2.1M views\n\n2. Tandoori Chicken Wrap — 10 mins — Stuff the chicken in flatbread with your veggies, quick meal\nhttps://www.youtube.com/watch?v=JbxJ8-SEGag · 891k views\n\n3. Tandoori Chicken Rice Bowl — 20 mins — Rice base with chicken, paneer, and veggies layered up\nhttps://www.youtube.com/watch?v=3kHdTSKI9zE · 556k views\n\nWhich one sounds good?"
+    },
+    {
+      "role": "user",
+      "content": "None of them - suggest something more spicy and better"
+    },
+    {
+      "role": "assistant",
+      "content": "I can only suggest from the recipes I have in my catalog, and those three are what match tandoori chicken + rice + paneer + 30 mins.\n\nWhat if you pick one of those and we spice it up during the cook — extra chilli, garlic, or a hot sauce mixed in?"
+    }
+  ],
+  "known_preferences": {
+    "liked": [],
+    "disliked": [],
+    "constraints": []
+  }
+}

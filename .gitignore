@@ -11,8 +11,6 @@ frontend/out/
 
 # Local data
 frontend/.data/
-backend/users/
-backend/*.db
 
 # IDE / tooling
 .claude/
