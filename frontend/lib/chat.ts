@@ -36,6 +36,18 @@ export type ChatMessage =
   | {
       id: string;
       role: "assistant";
+      type: "address-shortcut";
+      provider?: "swiggy-instamart" | "zepto" | "swiggy-food" | "swiggy-dineout";
+      title: string;
+      detail: string;
+      addressLine: string;
+      addressTag?: string;
+      primaryCtaLabel: string;
+      secondaryCtaLabel: string;
+    }
+  | {
+      id: string;
+      role: "assistant";
       type: "recipes";
       title: string;
       items: RecipeSuggestion[];

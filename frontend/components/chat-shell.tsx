@@ -533,6 +533,19 @@ export function ChatShell({ session }: ChatShellProps) {
       );
     }
 
+    if (lastAssistantMessage?.type === "address-shortcut") {
+      return dedupeChips([
+        {
+          label: lastAssistantMessage.primaryCtaLabel,
+          text: "Use the saved address",
+        },
+        {
+          label: lastAssistantMessage.secondaryCtaLabel,
+          text: "Show other saved addresses",
+        },
+      ]);
+    }
+
     if (lastAssistantMessage?.type === "dineout-restaurants") {
       const areaChips = rankLabelsByFrequency(
         lastAssistantMessage.items
@@ -982,6 +995,55 @@ export function ChatShell({ session }: ChatShellProps) {
                             </button>
                           </div>
                         ))}
+                      </div>
+                    </div>
+                  </article>
+                );
+              }
+
+              if (message.type === "address-shortcut") {
+                return (
+                  <article
+                    key={message.id}
+                    className="overflow-hidden rounded-[24px] border border-stone-200 bg-white shadow-sm"
+                  >
+                    <div className="border-b border-stone-200 px-4 py-3">
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-stone-500">
+                        {message.provider === "swiggy-dineout"
+                          ? "Saved location"
+                          : "Last used address"}
+                      </p>
+                      <h2 className="mt-2 text-lg font-semibold text-stone-950">
+                        {message.title}
+                      </h2>
+                      <p className="mt-2 text-sm leading-6 text-stone-600">
+                        {message.detail}
+                      </p>
+                    </div>
+                    <div className="space-y-3 px-4 py-4">
+                      <div className="rounded-2xl border border-stone-200 bg-stone-50 p-3">
+                        {message.addressTag ? (
+                          <p className="text-sm font-medium text-stone-900">
+                            {message.addressTag}
+                          </p>
+                        ) : null}
+                        <p className="mt-1 text-sm leading-6 text-stone-600">
+                          {message.addressLine}
+                        </p>
+                      </div>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <button
+                          onClick={() => void submitText("Use the saved address")}
+                          className="rounded-full bg-stone-950 px-4 py-3 text-sm font-medium text-white"
+                        >
+                          {message.primaryCtaLabel}
+                        </button>
+                        <button
+                          onClick={() => void submitText("Show other saved addresses")}
+                          className="rounded-full border border-stone-300 bg-white px-4 py-3 text-sm font-medium text-stone-700"
+                        >
+                          {message.secondaryCtaLabel}
+                        </button>
                       </div>
                     </div>
                   </article>
