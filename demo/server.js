@@ -1,6 +1,9 @@
 /**
  * demo/server.js — Vorel ordering demo
- * Run:  node demo/server.js   (MOCK_MODE always on — no real orders)
+ * Run:  node demo/server.js
+ *
+ * MOCK_MODE (default: true) — set to false in .env to place real orders.
+ * When true: providers use mock data, no real API calls are made.
  */
 
 import dotenv from 'dotenv'
@@ -9,14 +12,16 @@ import path from 'path'
 
 const __rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 dotenv.config({ path: path.join(__rootDir, '.env'), override: true })
-process.env.MOCK_MODE = 'true'
+
+// Default to mock mode — set MOCK_MODE=false in .env to enable live orders
+if (!('MOCK_MODE' in process.env)) process.env.MOCK_MODE = 'true'
 
 import express    from 'express'
 import Anthropic  from '@anthropic-ai/sdk'
 import Database   from 'better-sqlite3'
 import { VOREL_TOOLS, executeTool }          from '../pipeline/mcp/router.js'
 import { SwiggyFoodProvider }                from '../pipeline/mcp/providers/swiggy-food.js'
-import { getMockOrderStatus, fmtViews }      from '../pipeline/mcp/mock/data.js'
+import { getMockOrderStatus, fmtViews } from '../pipeline/mcp/mock/data.js'
 
 // ── Dishes DB ─────────────────────────────────────────────────────────────────
 const db = new Database(path.join(__rootDir, 'backend/dishes.db'), { readonly: true })
@@ -108,6 +113,13 @@ RESTAURANT ORDERING RULES (all mandatory, in order):
 5. ADD: YOU MUST call add_to_cart for each confirmed item — never say you're adding without calling the tool.
 6. STOP HERE. Say only: "Here's your cart — ready to place the order?" — the UI shows a cart card with items and pricing. Do NOT list items or prices in text.
 7. PLACE: only call place_order AFTER the user sends an explicit confirmation ("yes", "place it", "go ahead"). Never call place_order in the same response as add_to_cart.
+
+CART EDITING (after a cart exists):
+If the user wants to change the cart — remove an item, change a quantity, or says "actually skip the X" — use these tools:
+- remove_from_cart: call get_cart first to get item IDs, then call remove_from_cart with the matching id.
+- update_cart_item: same — get_cart to find the id, then update_cart_item with the new quantity. Quantity 0 removes it.
+After any cart edit, say only: "Done — here's your updated cart." The UI re-renders automatically. Do NOT list items.
+Never call place_order in the same response as a cart edit.
 
 CRITICAL TOOL RULES:
 - order_ingredients and add_to_cart MUST always be called as actual tool calls — never narrate ordering without calling the tool
@@ -447,6 +459,30 @@ app.get('/demo/track/:orderId', (req, res) => {
   res.json(status)
 })
 
+// Update a cart item's quantity — routes through the provider layer (MCP-aware)
+app.patch('/demo/cart/:type/item/:itemId', async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || 'default'
+  const type      = req.params.type === 'food' ? 'food' : 'grocery'
+  const qty       = Number(req.body.qty)
+  if (!Number.isFinite(qty)) return res.status(400).json({ error: 'qty must be a number' })
+  const tool = qty <= 0 ? 'remove_from_cart' : 'update_cart_item'
+  const args = qty <= 0
+    ? { type, item_id: req.params.itemId }
+    : { type, item_id: req.params.itemId, quantity: qty }
+  await executeTool(tool, args, { ...DEMO_CONTEXT, sessionId })
+  const result = await executeTool('get_cart', { type }, { ...DEMO_CONTEXT, sessionId })
+  res.json(cartCardFromResult(result) ?? { empty: true })
+})
+
+// Remove a cart item — routes through the provider layer (MCP-aware)
+app.delete('/demo/cart/:type/item/:itemId', async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || 'default'
+  const type      = req.params.type === 'food' ? 'food' : 'grocery'
+  await executeTool('remove_from_cart', { type, item_id: req.params.itemId }, { ...DEMO_CONTEXT, sessionId })
+  const result = await executeTool('get_cart', { type }, { ...DEMO_CONTEXT, sessionId })
+  res.json(cartCardFromResult(result) ?? { empty: true })
+})
+
 // Returns the live cart for a session (food or grocery) as a cart card object
 app.get('/demo/cart/:type', async (req, res) => {
   const sessionId = req.headers['x-session-id'] || 'default'
@@ -635,6 +671,22 @@ header {
 .cart-btn.place { background: var(--ink); color: white; }
 .cart-btn.place:hover { background: #333; }
 .cart-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Cart edit controls ── */
+.cart-controls { display: none; align-items: center; gap: 3px; flex-shrink: 0; }
+.cart-card.editing .cart-controls { display: flex; }
+.cart-card.editing .cart-qty { display: none; }
+.ctrl-btn {
+  width: 26px; height: 26px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--cream);
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink2); line-height: 1; padding: 0;
+  font-family: 'DM Sans', sans-serif; transition: background 0.1s;
+}
+.ctrl-btn:active { background: var(--cream2); }
+.ctrl-btn.del { background: #fff0f0; border-color: #fecaca; color: #e53e3e; font-size: 11px; }
+.ctrl-qty { width: 20px; text-align: center; font-size: 13px; font-weight: 700; }
 
 /* ── Order card (inline in chat) ── */
 .order-card {
@@ -896,22 +948,36 @@ footer {
   }
 
   // ── Cart card ─────────────────────────────────────────────────────────────
-  function renderCart(c) {
+  function renderCart(c, editMode = false) {
     document.querySelectorAll('.cart-card').forEach(el => el.remove())
-    const isGrocery  = !c.restaurant_name
-    const title      = c.restaurant_name || 'Your groceries'
-    const count      = c.item_count ?? c.items.length
-    const itemsHTML  = c.items.map(i => {
-      const qty = i.quantity ?? 1
-      const amt = i.subtotal ?? (i.price * qty)
-      return \`<div class="cart-item"><div class="cart-qty">\${qty}</div><div class="cart-name">\${esc(i.name)}</div><div class="cart-price">₹\${amt}</div></div>\`
-    }).join('')
-    const delivHTML  = c.delivery_fee === 0
+    const isGrocery = !c.restaurant_name
+    const cartType  = isGrocery ? 'grocery' : 'food'
+    const title     = c.restaurant_name || 'Your groceries'
+    const count     = c.item_count ?? c.items.length
+    const delivHTML = c.delivery_fee === 0
       ? '<span class="free-tag">FREE</span>'
       : \`₹\${c.delivery_fee}\`
 
+    const itemsHTML = c.items.map(i => {
+      const qty   = i.quantity ?? 1
+      const amt   = i.subtotal ?? (i.price * qty)
+      const id    = esc(i.id ?? '')
+      return \`
+        <div class="cart-item" data-id="\${id}">
+          <div class="cart-qty">\${qty}</div>
+          <div class="cart-controls">
+            <button class="ctrl-btn minus">−</button>
+            <span class="ctrl-qty">\${qty}</span>
+            <button class="ctrl-btn plus">+</button>
+            <button class="ctrl-btn del">✕</button>
+          </div>
+          <div class="cart-name">\${esc(i.name)}</div>
+          <div class="cart-price">₹\${amt}</div>
+        </div>\`
+    }).join('')
+
     const div = document.createElement('div')
-    div.className = 'cart-card'
+    div.className = 'cart-card' + (editMode ? ' editing' : '')
     div.innerHTML = \`
       <div class="cart-head">
         <div class="cart-icon">\${isGrocery ? '🛒' : '🍽'}</div>
@@ -926,16 +992,60 @@ footer {
         <div class="cart-row grand"><span>Total</span><span>₹\${c.total}</span></div>
       </div>
       <div class="cart-actions">
-        <button class="cart-btn edit">Edit</button>
-        <button class="cart-btn place">Place order →</button>
+        <button class="cart-btn edit">\${editMode ? 'Done' : 'Edit'}</button>
+        <button class="cart-btn place" \${editMode ? 'disabled' : ''}>Place order →</button>
       </div>
     \`
-    div.querySelector('.cart-btn.place').onclick = () => {
-      div.querySelector('.cart-btn.place').disabled = true
-      div.querySelector('.cart-btn.place').textContent = 'Placing…'
-      send('Yes, place the order')
+
+    // Edit / Done toggle
+    div.querySelector('.cart-btn.edit').onclick = () => renderCart(c, !editMode)
+
+    // Place order (disabled in edit mode)
+    if (!editMode) {
+      div.querySelector('.cart-btn.place').onclick = () => {
+        div.querySelector('.cart-btn.place').disabled = true
+        div.querySelector('.cart-btn.place').textContent = 'Placing…'
+        send('Yes, place the order')
+      }
     }
-    div.querySelector('.cart-btn.edit').onclick = () => send('I want to change my order')
+
+    // Row-level edit controls
+    const apiFetch = async (url, opts = {}) => {
+      const r = await fetch(url, {
+        ...opts,
+        headers: { 'Content-Type': 'application/json', 'x-session-id': SESSION_ID, ...(opts.headers || {}) },
+      })
+      return r.json()
+    }
+
+    div.querySelectorAll('.cart-item[data-id]').forEach(row => {
+      const id = row.dataset.id
+      if (!id) return
+      const qtyEl = row.querySelector('.ctrl-qty')
+
+      row.querySelector('.ctrl-btn.minus').onclick = async () => {
+        const next = parseInt(qtyEl.textContent) - 1
+        const updated = next <= 0
+          ? await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'DELETE' })
+          : await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'PATCH', body: JSON.stringify({ qty: next }) })
+        if (updated && !updated.empty && updated.items?.length) renderCart(updated, true)
+        else document.querySelectorAll('.cart-card').forEach(el => el.remove())
+      }
+
+      row.querySelector('.ctrl-btn.plus').onclick = async () => {
+        const next = parseInt(qtyEl.textContent) + 1
+        const updated = await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'PATCH', body: JSON.stringify({ qty: next }) })
+        if (updated && !updated.empty && updated.items?.length) renderCart(updated, true)
+      }
+
+      row.querySelector('.ctrl-btn.del').onclick = async () => {
+        row.style.opacity = '0.35'
+        const updated = await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'DELETE' })
+        if (updated && !updated.empty && updated.items?.length) renderCart(updated, true)
+        else document.querySelectorAll('.cart-card').forEach(el => el.remove())
+      }
+    })
+
     messagesEl.appendChild(div)
     scrollBottom()
     return div
@@ -1368,6 +1478,21 @@ footer{
   flex-shrink:0;
 }
 #snd:disabled{background:#c7c0b7;cursor:default}
+
+/* ── Cart edit controls (demo2) ── */
+.cart-controls2{display:none;align-items:center;gap:3px;flex-shrink:0}
+.cart-card.editing .cart-controls2{display:flex}
+.cart-card.editing .cart-qty2{display:none}
+.cbtn{
+  width:26px;height:26px;border-radius:8px;
+  border:1px solid var(--line);background:var(--surface-2);
+  font-size:14px;font-weight:700;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  color:#47413b;line-height:1;padding:0;
+  font-family:'DM Sans',sans-serif;
+}
+.cbtn.del{background:#fff0f0;border-color:#fecaca;color:#e53e3e;font-size:11px}
+.cqty{width:20px;text-align:center;font-size:13px;font-weight:700}
 </style>
 </head>
 <body>
@@ -1467,21 +1592,34 @@ function showRecipes(recipes) {
   appendBlock(stack)
 }
 
-function showCart(card) {
-  const count = card.item_count ?? card.items.length
+function showCart(card, editMode = false) {
+  // Remove any existing cart card and re-render (keeps a single live card)
+  document.querySelectorAll('.cart-card').forEach(el => el.remove())
+
+  const count    = card.item_count ?? card.items.length
+  const cartType = card.restaurant_name ? 'food' : 'grocery'
+
   const itemRows = card.items.map(item => {
-    const qty = item.quantity ?? 1
+    const qty     = item.quantity ?? 1
     const subtotal = item.subtotal ?? (item.price * qty)
+    const id      = esc(item.id ?? '')
     return \`
-      <div class="cart-item">
-        <div class="cart-name">\${esc(item.name)}<small>Qty \${qty}</small></div>
+      <div class="cart-item" data-id="\${id}">
+        <div class="cart-qty2"><small>×\${qty}</small></div>
+        <div class="cart-controls2">
+          <button class="cbtn minus" type="button">−</button>
+          <span class="cqty">\${qty}</span>
+          <button class="cbtn plus" type="button">+</button>
+          <button class="cbtn del" type="button">✕</button>
+        </div>
+        <div class="cart-name">\${esc(item.name)}</div>
         <div>₹\${subtotal}</div>
       </div>
     \`
   }).join('')
 
   const node = document.createElement('section')
-  node.className = 'card'
+  node.className = 'card cart-card' + (editMode ? ' editing' : '')
   node.innerHTML = \`
     <div class="section-title">Cart</div>
     <div class="cart-body">
@@ -1499,17 +1637,56 @@ function showCart(card) {
         <div class="total-row grand"><span>Total</span><span>₹\${card.total}</span></div>
       </div>
       <div class="actions">
-        <button class="btn secondary" type="button">Edit</button>
-        <button class="btn primary" type="button">Place order</button>
+        <button class="btn secondary" type="button">\${editMode ? 'Done' : 'Edit'}</button>
+        <button class="btn primary" type="button" \${editMode ? 'disabled' : ''}>Place order</button>
       </div>
     </div>
   \`
-  node.querySelector('.btn.secondary').addEventListener('click', () => send('I want to change my order'))
-  node.querySelector('.btn.primary').addEventListener('click', e => {
-    e.currentTarget.disabled = true
-    e.currentTarget.textContent = 'Placing…'
-    send('Yes, place the order')
+
+  // Edit / Done toggle
+  node.querySelector('.btn.secondary').addEventListener('click', () => showCart(card, !editMode))
+
+  // Place order (disabled in edit mode)
+  if (!editMode) {
+    node.querySelector('.btn.primary').addEventListener('click', e => {
+      e.currentTarget.disabled = true
+      e.currentTarget.textContent = 'Placing…'
+      send('Yes, place the order')
+    })
+  }
+
+  // Row-level controls
+  const apiFetch = (url, opts = {}) =>
+    api(url, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } }).then(r => r.json())
+
+  node.querySelectorAll('.cart-item[data-id]').forEach(row => {
+    const id   = row.dataset.id
+    if (!id) return
+    const qtyEl = row.querySelector('.cqty')
+
+    row.querySelector('.cbtn.minus').addEventListener('click', async () => {
+      const next = parseInt(qtyEl.textContent) - 1
+      const updated = next <= 0
+        ? await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'DELETE' })
+        : await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'PATCH', body: JSON.stringify({ qty: next }) })
+      if (updated && !updated.empty && updated.items?.length) showCart(updated, true)
+      else document.querySelectorAll('.cart-card').forEach(el => el.remove())
+    })
+
+    row.querySelector('.cbtn.plus').addEventListener('click', async () => {
+      const next    = parseInt(qtyEl.textContent) + 1
+      const updated = await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'PATCH', body: JSON.stringify({ qty: next }) })
+      if (updated && !updated.empty && updated.items?.length) showCart(updated, true)
+    })
+
+    row.querySelector('.cbtn.del').addEventListener('click', async () => {
+      row.style.opacity = '0.35'
+      const updated = await apiFetch(\`/demo/cart/\${cartType}/item/\${encodeURIComponent(id)}\`, { method: 'DELETE' })
+      if (updated && !updated.empty && updated.items?.length) showCart(updated, true)
+      else document.querySelectorAll('.cart-card').forEach(el => el.remove())
+    })
   })
+
   appendBlock(node)
 }
 
@@ -1676,7 +1853,8 @@ init()
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.DEMO_PORT || 3001
+const MOCK_MODE = process.env.MOCK_MODE !== 'false'
 app.listen(PORT, () => {
   console.log(`Vorel demo → http://localhost:${PORT}/demo`)
-  console.log(`MOCK_MODE: on`)
+  console.log(`Mode: ${MOCK_MODE ? '🟡 mock (no real orders)' : '🟢 live (real orders enabled)'}`)
 })

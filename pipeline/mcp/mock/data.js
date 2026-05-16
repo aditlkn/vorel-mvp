@@ -369,6 +369,7 @@ export function buildCartSummary(items, { deliveryFee = 0, taxRate = 0.05, resta
   return {
     ...(restaurantId != null && { restaurant_id: restaurantId, restaurant_name: restaurantName }),
     items:      items.map(i => ({
+      id:       i.item_id ?? i.product_id,   // stable ID for UI cart edits
       name:     i.name,
       quantity: i.quantity,
       price:    i.price,
@@ -380,6 +381,25 @@ export function buildCartSummary(items, { deliveryFee = 0, taxRate = 0.05, resta
     taxes,
     total:      subtotal + delivery_fee + taxes,
     item_count: items.reduce((s, i) => s + i.quantity, 0),
+  }
+}
+
+// ── Cart mutation helpers (used by REST edit endpoints) ──────────────────────
+
+export function removeCartItem(sessionId, type, itemId) {
+  const cart  = getCartStore(sessionId)[type]
+  const idKey = type === 'food' ? 'item_id' : 'product_id'
+  cart.items  = cart.items.filter(i => i[idKey] !== itemId)
+}
+
+export function updateCartItemQty(sessionId, type, itemId, qty) {
+  const cart  = getCartStore(sessionId)[type]
+  const idKey = type === 'food' ? 'item_id' : 'product_id'
+  if (qty <= 0) {
+    cart.items = cart.items.filter(i => i[idKey] !== itemId)
+  } else {
+    const item = cart.items.find(i => i[idKey] === itemId)
+    if (item) item.quantity = qty
   }
 }
 

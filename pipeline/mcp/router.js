@@ -137,6 +137,31 @@ export const VOREL_TOOLS = [
     },
   },
   {
+    name: 'remove_from_cart',
+    description: 'Remove a specific item from the active cart. Call get_cart first to obtain item IDs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        type:    { type: 'string', enum: ['food', 'grocery'], description: 'Which cart to modify' },
+        item_id: { type: 'string', description: 'The id field from a get_cart item' },
+      },
+      required: ['type', 'item_id'],
+    },
+  },
+  {
+    name: 'update_cart_item',
+    description: 'Change the quantity of an item already in the cart. Use quantity 0 to remove it.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        type:     { type: 'string', enum: ['food', 'grocery'], description: 'Which cart to modify' },
+        item_id:  { type: 'string', description: 'The id field from a get_cart item' },
+        quantity: { type: 'number', description: 'New quantity (0 removes the item)' },
+      },
+      required: ['type', 'item_id', 'quantity'],
+    },
+  },
+  {
     name: 'get_cart',
     description: 'Retrieve the current cart contents and order summary.',
     input_schema: {
@@ -306,6 +331,18 @@ export async function executeTool(toolName, input, context = {}) {
           })
         }
       })
+    }
+
+    case 'remove_from_cart': {
+      const category = input.type === 'grocery' ? 'grocery' : 'food'
+      const idParam  = category === 'grocery' ? { product_id: input.item_id } : { item_id: input.item_id }
+      return withFallback(category, p => p.removeFromCart({ ...idParam, sessionId }))
+    }
+
+    case 'update_cart_item': {
+      const category = input.type === 'grocery' ? 'grocery' : 'food'
+      const idParam  = category === 'grocery' ? { product_id: input.item_id } : { item_id: input.item_id }
+      return withFallback(category, p => p.updateCartItem({ ...idParam, quantity: input.quantity, sessionId }))
     }
 
     case 'get_cart': {

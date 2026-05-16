@@ -76,6 +76,29 @@ export class SwiggyInstamartProvider {
     return this._call('add_to_cart', { product_id, quantity })
   }
 
+  async removeFromCart({ product_id, sessionId = 'default' }) {
+    if (this._mock) {
+      const cart = getCartStore(sessionId).grocery
+      cart.items = cart.items.filter(i => i.product_id !== product_id)
+      return _groceryCartSummary(cart)
+    }
+    return this._call('remove_from_cart', { product_id })
+  }
+
+  async updateCartItem({ product_id, quantity, sessionId = 'default' }) {
+    if (this._mock) {
+      const cart = getCartStore(sessionId).grocery
+      if (quantity <= 0) {
+        cart.items = cart.items.filter(i => i.product_id !== product_id)
+      } else {
+        const item = cart.items.find(i => i.product_id === product_id)
+        if (item) item.quantity = quantity
+      }
+      return _groceryCartSummary(cart)
+    }
+    return this._call('update_cart_item', { product_id, quantity })
+  }
+
   async getCart({ sessionId = 'default' } = {}) {
     if (this._mock) return _groceryCartSummary(getCartStore(sessionId).grocery)
     return this._call('get_cart', {})

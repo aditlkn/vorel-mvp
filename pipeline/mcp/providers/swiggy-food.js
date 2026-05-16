@@ -116,6 +116,29 @@ export class SwiggyFoodProvider {
     return this._call('add_to_cart', { restaurant_id, item_id, quantity, customizations })
   }
 
+  async removeFromCart({ item_id, sessionId = 'default' }) {
+    if (this._mock) {
+      const cart = getCartStore(sessionId).food
+      cart.items = cart.items.filter(i => i.item_id !== item_id)
+      return _cartSummary(cart)
+    }
+    return this._call('remove_from_cart', { item_id })
+  }
+
+  async updateCartItem({ item_id, quantity, sessionId = 'default' }) {
+    if (this._mock) {
+      const cart = getCartStore(sessionId).food
+      if (quantity <= 0) {
+        cart.items = cart.items.filter(i => i.item_id !== item_id)
+      } else {
+        const item = cart.items.find(i => i.item_id === item_id)
+        if (item) item.quantity = quantity
+      }
+      return _cartSummary(cart)
+    }
+    return this._call('update_cart_item', { item_id, quantity })
+  }
+
   async getCart({ sessionId = 'default' } = {}) {
     if (this._mock) return _cartSummary(getCartStore(sessionId).food)
     return this._call('get_cart', {})
