@@ -251,3 +251,22 @@ export function resolveProviderAddressId(
 
   return ranked[0] && ranked[0].score >= 12 ? ranked[0].id : null;
 }
+
+export function resolveResolvedAddress(
+  selectedAddress: ResolvedAddress | SavedAddress | null,
+  resolvedAddresses: ResolvedAddress[],
+) {
+  if (!selectedAddress) {
+    return null;
+  }
+
+  const selectedProfile = buildProfile(selectedAddress);
+  const ranked = resolvedAddresses
+    .map((address) => ({
+      address,
+      score: scoreProfiles(selectedProfile, buildProfile(address)),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  return ranked[0] && ranked[0].score >= 12 ? ranked[0].address : null;
+}

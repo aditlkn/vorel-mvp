@@ -35,6 +35,12 @@ import {
   type UserContext,
 } from "@/lib/intent-parser";
 import { detectLoop } from "@/lib/loop-guard";
+import {
+  getPersistedLastUsedAddress,
+  setPersistedLastUsedAddress,
+  type PersistedLastUsedAddress,
+} from "@/lib/last-used-address-store";
+import { getPersistedAuthState } from "@/lib/grocery-auth-store";
 import { getActiveCartProvidersForSlug } from "@/lib/provider-preferences";
 type ConversationStage =
   | "collecting-context"
@@ -294,6 +300,36 @@ function getSessions() {
     globalStore.__vorelChatSessions = new Map<string, SessionState>();
   }
   return globalStore.__vorelChatSessions;
+}
+
+function getLastUsedAddress(slug: string) {
+  return getPersistedLastUsedAddress(slug, resolveAddressScopeKey(slug)) as PersistedLastUsedAddress | null;
+}
+
+function rememberLastUsedAddress(slug: string, address: ResolvedAddress | null) {
+  if (!address) {
+    return;
+  }
+  setPersistedLastUsedAddress(slug, address, resolveAddressScopeKey(slug));
+}
+
+function resolveAddressScopeKey(slug: string) {
+  const normalizedSlug = slug.trim().toLowerCase();
+  const providerOrder: GroceryProviderId[] = [
+    "swiggy-instamart",
+    "zepto",
+    "swiggy-food",
+    "swiggy-dineout",
+  ];
+
+  for (const provider of providerOrder) {
+    const delegatedUserId = getPersistedAuthState(provider, normalizedSlug).delegatedUserId;
+    if (typeof delegatedUserId === "string" && delegatedUserId) {
+      return `${provider}:${delegatedUserId}`;
+    }
+  }
+
+  return null;
 }
 
 function createMessage(
@@ -948,6 +984,10 @@ function buildProviderSelectionMessage(
 function buildAddressMessage(
   addresses: ResolvedAddress[],
   provider: GroceryProviderId = "swiggy-instamart",
+  overrides?: {
+    title?: string;
+    detail?: string;
+  },
 ): Extract<ChatMessage, { type: "addresses" }> {
   const isFood = provider === "swiggy-food";
   const isDineout = provider === "swiggy-dineout";
@@ -956,17 +996,20 @@ function buildAddressMessage(
     role: "assistant",
     type: "addresses",
     provider,
-    title: isFood
-      ? "Choose the delivery address for this restaurant search."
-      : isDineout
-        ? "Choose the location for this dine-out search."
-      : "Choose the delivery address for this grocery cart.",
+    title:
+      overrides?.title ??
+      (isFood
+        ? "Choose the delivery address for this restaurant search."
+        : isDineout
+          ? "Choose the location for this dine-out search."
+        : "Choose the delivery address for this grocery cart."),
     detail:
-      isFood
+      overrides?.detail ??
+      (isFood
         ? "I found your saved Swiggy Food delivery addresses. Pick one and I’ll look for nearby restaurants there."
         : isDineout
           ? "I found your saved Swiggy Dineout locations. Pick one and I’ll search for nearby bookable restaurants there."
-        : "I found the saved delivery addresses across your connected grocery providers. Pick one and I’ll use the closest match for each cart.",
+          : "I found the saved delivery addresses across your connected grocery providers. Pick one and I’ll use the closest match for each cart."),
     items: addresses.map((address) => ({
       id: address.id,
       addressLine: address.addressLine,
@@ -974,6 +1017,54 @@ function buildAddressMessage(
       ctaLabel: "Use this address",
     })),
   };
+}
+
+function buildLastUsedAddressMessage(
+  address: ResolvedAddress,
+  provider?: GroceryProviderId,
+): Extract<ChatMessage, { type: "address-shortcut" }> {
+  const isDineout = provider === "swiggy-dineout";
+  return {
+    id: `address-shortcut-${Date.now()}`,
+    role: "assistant",
+    type: "address-shortcut",
+    provider,
+    title: isDineout ? "Use your last dine-out location?" : "Use your last delivery address?",
+    detail: isDineout
+      ? "I can reuse the last saved location you picked, or load your other saved locations if you want a different one."
+      : "I can reuse the last saved address you picked, or load your other saved addresses if you want a different one.",
+    addressLine: address.addressLine,
+    addressTag: address.addressTag,
+    primaryCtaLabel: isDineout ? "Use this location" : "Use this address",
+    secondaryCtaLabel: isDineout ? "Show other locations" : "Show other addresses",
+  };
+}
+
+function getStoredProviderAddressId(
+  address: ResolvedAddress | null,
+  provider: GroceryProviderId,
+) {
+  return address?.providerIds?.[provider] ?? null;
+}
+
+function hasStoredProviderAddressIds(
+  address: ResolvedAddress | null,
+  providers: GroceryProviderId[],
+) {
+  return Boolean(
+    address &&
+      providers.every((provider) => typeof address.providerIds?.[provider] === "string"),
+  );
+}
+
+function looksLikeProviderAddressMismatch(args: {
+  reason?: string | null;
+  errorCode?: string | null;
+}) {
+  const text = `${args.errorCode ?? ""} ${args.reason ?? ""}`.toLowerCase();
+  return /\baddress|location|serviceable|delivery address|saved address|addressid|not found|invalid\b/.test(
+    text,
+  );
 }
 
 function buildRestaurantConnectMessage(
@@ -1817,6 +1908,244 @@ async function buildComparisonMessage(
     };
   }
 
+  if (!selectedAddress) {
+    const lastUsedAddress = getLastUsedAddress(slug)?.address ?? null;
+    if (lastUsedAddress) {
+      return {
+        kind: "address" as const,
+        message: buildLastUsedAddressMessage(lastUsedAddress),
+      };
+    }
+  }
+
+  if (hasStoredProviderAddressIds(selectedAddress, connectedProviders)) {
+    const cartEntries = await Promise.all(
+      connectedProviders.map(async (provider) => {
+        const addressId = getStoredProviderAddressId(selectedAddress, provider);
+        const cartResult = await grocery.buildGroceryCart(
+          provider,
+          slug,
+          missingIngredients,
+          addressId,
+        );
+        return { provider, cartResult };
+      }),
+    );
+
+    const readyEntries: Array<{
+      provider: GroceryCartProviderId;
+      cartResult: Extract<GroceryCartResult, { status: "ready" }>;
+    }> = [];
+    const unavailableEntries: Array<{
+      provider: GroceryCartProviderId;
+      cartResult: Extract<GroceryCartResult, { status: "unavailable" }>;
+    }> = [];
+    let swiggyUnavailableEntry:
+      | {
+          provider: GroceryCartProviderId;
+          cartResult: Extract<GroceryCartResult, { status: "unavailable" }>;
+        }
+      | undefined;
+    let authRequiredEntry:
+      | {
+          provider: GroceryCartProviderId;
+          cartResult: Extract<GroceryCartResult, { status: "auth_required" }>;
+        }
+      | undefined;
+
+    for (const entry of cartEntries) {
+      if (entry.cartResult.status === "ready") {
+        readyEntries.push({
+          provider: entry.provider,
+          cartResult: entry.cartResult,
+        });
+        continue;
+      }
+
+      if (entry.cartResult.status === "auth_required" && !authRequiredEntry) {
+        authRequiredEntry = {
+          provider: entry.provider,
+          cartResult: entry.cartResult,
+        };
+        continue;
+      }
+
+      if (entry.cartResult.status === "unavailable") {
+        unavailableEntries.push({
+          provider: entry.provider,
+          cartResult: entry.cartResult,
+        });
+        if (entry.provider === "swiggy-instamart" && !swiggyUnavailableEntry) {
+          swiggyUnavailableEntry = {
+            provider: entry.provider,
+            cartResult: entry.cartResult,
+          };
+        }
+      }
+    }
+
+    if (authRequiredEntry) {
+      return {
+        kind: "provider" as const,
+        message: buildAuthRecoveryMessage(
+          slug,
+          authRequiredEntry.provider,
+          authRequiredEntry.cartResult.authReason,
+          `${getGroceryProviderLabel(authRequiredEntry.provider)} needs to be reconnected before building this cart.`,
+        ),
+      };
+    }
+
+    if (
+      swiggyUnavailableEntry &&
+      "code" in swiggyUnavailableEntry.cartResult &&
+      typeof swiggyUnavailableEntry.cartResult.code === "string"
+    ) {
+      if (
+        looksLikeProviderAddressMismatch({
+          reason: swiggyUnavailableEntry.cartResult.reason,
+          errorCode: swiggyUnavailableEntry.cartResult.code,
+        })
+      ) {
+        const refreshedAddresses = await listResolvedAddressesForSession(slug);
+        if (refreshedAddresses.length) {
+          return {
+            kind: "address" as const,
+            message: buildAddressMessage(refreshedAddresses, "swiggy-instamart", {
+              title: "The saved provider address is no longer available.",
+              detail:
+                "At least one provider could not use the previously saved address anymore. Pick a current saved address and I’ll rebuild the live carts.",
+            }),
+          };
+        }
+      }
+      return {
+        kind: "provider" as const,
+        message: buildSwiggyErrorMessage(slug, swiggyUnavailableEntry.cartResult.code),
+      };
+    }
+
+    const completeReadyEntries = readyEntries.filter(
+      ({ cartResult }) => cartResult.unresolvedIngredients.length === 0,
+    );
+
+    if (completeReadyEntries.length === 1) {
+      const selected = buildSelectedCartMessage(
+        recipe,
+        completeReadyEntries[0].provider,
+        completeReadyEntries[0].cartResult.items,
+        completeReadyEntries[0].cartResult.unresolvedIngredients,
+        {
+          subtotal: completeReadyEntries[0].cartResult.subtotal,
+          fees: completeReadyEntries[0].cartResult.fees,
+          total: completeReadyEntries[0].cartResult.total,
+        },
+        completeReadyEntries[0].cartResult.note,
+      );
+
+      return {
+        kind: "cart" as const,
+        message: selected,
+        option: {
+          provider: completeReadyEntries[0].provider,
+          items: completeReadyEntries[0].cartResult.items,
+          unresolvedIngredients: completeReadyEntries[0].cartResult.unresolvedIngredients,
+          subtotal: completeReadyEntries[0].cartResult.subtotal,
+          fees: completeReadyEntries[0].cartResult.fees,
+          total: completeReadyEntries[0].cartResult.total,
+          note: completeReadyEntries[0].cartResult.note,
+        },
+      };
+    }
+
+    if (completeReadyEntries.length > 1) {
+      return {
+        kind: "comparison" as const,
+        message: {
+          id: `provider-carts-${recipe.id}-${Date.now()}`,
+          role: "assistant",
+          type: "provider-carts",
+          recipeName: recipe.name,
+          title: "Compare live grocery carts",
+          items: completeReadyEntries.map(({ provider, cartResult }) => {
+            const selected = buildSelectedCartMessage(
+              recipe,
+              provider,
+              cartResult.items,
+              cartResult.unresolvedIngredients,
+              {
+                subtotal: cartResult.subtotal,
+                fees: cartResult.fees,
+                total: cartResult.total,
+              },
+              cartResult.note,
+            );
+            return {
+              provider,
+              label: getGroceryProviderLabel(provider),
+              title: selected.title,
+              items: selected.items,
+              subtotal: selected.subtotal,
+              fees: selected.fees,
+              total: selected.total,
+            };
+          }),
+        } satisfies Extract<ChatMessage, { type: "provider-carts" }>,
+        options: completeReadyEntries.map(({ provider, cartResult }) => ({
+          provider,
+          items: cartResult.items,
+          unresolvedIngredients: cartResult.unresolvedIngredients,
+          subtotal: cartResult.subtotal,
+          fees: cartResult.fees,
+          total: cartResult.total,
+          note: cartResult.note,
+        })),
+      };
+    }
+
+    const incompleteEntries = [
+      ...readyEntries
+        .filter(({ cartResult }) => cartResult.unresolvedIngredients.length > 0)
+        .map(({ provider, cartResult }) => ({
+          provider,
+          unresolvedIngredients: cartResult.unresolvedIngredients,
+        })),
+      ...unavailableEntries.map(({ provider, cartResult }) => ({
+        provider,
+        unresolvedIngredients:
+          "unresolvedIngredients" in cartResult &&
+          Array.isArray(cartResult.unresolvedIngredients)
+            ? cartResult.unresolvedIngredients
+            : [],
+      })),
+    ];
+
+    if (readyEntries.length || unavailableEntries.length) {
+      const addressMismatchEntry = unavailableEntries.find(({ cartResult }) =>
+        looksLikeProviderAddressMismatch({
+          reason: cartResult.reason,
+          errorCode: cartResult.errorCode ?? null,
+        }),
+      );
+      if (addressMismatchEntry) {
+        const refreshedAddresses = await listResolvedAddressesForSession(slug);
+        if (refreshedAddresses.length) {
+          return {
+            kind: "address" as const,
+            message: buildAddressMessage(refreshedAddresses, addressMismatchEntry.provider, {
+              title: "The saved provider address is no longer available.",
+              detail: `The previously saved ${getGroceryProviderLabel(addressMismatchEntry.provider)} address could not be used anymore. Pick a current saved address and I’ll rebuild the live carts.`,
+            }),
+          };
+        }
+      }
+      return {
+        kind: "blocked" as const,
+        message: buildIncompleteCartMessage(recipe, incompleteEntries),
+      };
+    }
+  }
+
   const addressEntries = await Promise.all(
     connectedProviders.map(async (provider) => ({
       provider,
@@ -2171,6 +2500,90 @@ async function buildRestaurantFallbackState(
     };
   }
 
+  if (!selectedAddress) {
+    const lastUsedAddress = getLastUsedAddress(slug)?.address ?? null;
+    if (lastUsedAddress) {
+      return {
+        kind: "address" as const,
+        message: buildLastUsedAddressMessage(lastUsedAddress, "swiggy-food"),
+      };
+    }
+  }
+
+  const storedAddressId = getStoredProviderAddressId(selectedAddress, "swiggy-food");
+  if (storedAddressId && selectedAddress) {
+    const restaurantResult = await grocery.searchProviderRestaurants(
+      "swiggy-food",
+      slug,
+      recipe.name,
+      storedAddressId,
+    );
+
+    if (restaurantResult.status === "auth_required") {
+      return {
+        kind: "provider" as const,
+        message: buildAuthRecoveryMessage(
+          slug,
+          "swiggy-food",
+          restaurantResult.authReason,
+          "Swiggy Food needs to be reconnected before restaurant search.",
+        ),
+      };
+    }
+
+    if (restaurantResult.status === "unavailable") {
+      if (
+        looksLikeProviderAddressMismatch({
+          reason: restaurantResult.reason,
+          errorCode: restaurantResult.errorCode ?? null,
+        })
+      ) {
+        const refreshedAddresses = await loadAddressOptionsForSession({
+          ...createInitialState(slug, "eat-out"),
+          slug,
+          selectedRecipe: recipe,
+          eatOutMode: "delivery",
+          pendingRestaurantFallback: true,
+        });
+        if (refreshedAddresses.length) {
+          return {
+            kind: "address" as const,
+            message: buildAddressMessage(refreshedAddresses, "swiggy-food", {
+              title: "The saved Swiggy Food address is no longer available.",
+              detail:
+                "The previously saved Swiggy Food address could not be used anymore. Pick a current saved address and I’ll search again.",
+            }),
+          };
+        }
+      }
+      return {
+        kind: "blocked" as const,
+        message: createMessage(
+          "assistant",
+          `${restaurantResult.reason} I couldn’t find a reliable restaurant fallback for ${recipe.name} yet.`,
+          `food-search-error-${recipe.id}-${Date.now()}`,
+        ),
+      };
+    }
+
+    const rankedRestaurants = rerankDeliveryRestaurants(
+      restaurantResult.restaurants,
+      recipe.name,
+      context?.diet ?? null,
+      refinement,
+    );
+
+    return {
+      kind: "restaurants" as const,
+      message: buildRestaurantResultsMessage(
+        recipe,
+        rankedRestaurants,
+        deliveryRefinementNote(refinement),
+      ),
+      resolvedAddress: selectedAddress,
+    };
+  }
+
   const addressResult = await grocery.listGroceryAddresses("swiggy-food", slug);
   if (addressResult.status === "auth_required") {
     return {
@@ -2275,6 +2688,101 @@ async function buildFoodCartState(
   selectedAddress: ResolvedAddress | null,
 ) {
   const grocery = await loadGroceryModule();
+  if (!selectedAddress) {
+    const lastUsedAddress = getLastUsedAddress(slug)?.address ?? null;
+    if (lastUsedAddress) {
+      return {
+        kind: "address" as const,
+        message: buildLastUsedAddressMessage(lastUsedAddress, "swiggy-food"),
+      };
+    }
+  }
+
+  const storedAddressId = getStoredProviderAddressId(selectedAddress, "swiggy-food");
+  if (storedAddressId && selectedAddress) {
+    const foodCartResult = await grocery.buildProviderFoodCart(
+      "swiggy-food",
+      slug,
+      storedAddressId,
+      restaurant.id,
+      recipe.name,
+    );
+
+    if (foodCartResult.status === "auth_required") {
+      return {
+        kind: "provider" as const,
+        message: buildAuthRecoveryMessage(
+          slug,
+          "swiggy-food",
+          foodCartResult.authReason,
+          "Swiggy Food needs to be reconnected before building the food cart.",
+        ),
+      };
+    }
+
+    if (foodCartResult.status === "unavailable") {
+      if (
+        looksLikeProviderAddressMismatch({
+          reason: foodCartResult.reason,
+          errorCode: foodCartResult.errorCode ?? null,
+        })
+      ) {
+        const refreshedAddresses = await loadAddressOptionsForSession({
+          ...createInitialState(slug, "eat-out"),
+          slug,
+          selectedRecipe: recipe,
+          eatOutMode: "delivery",
+          pendingFoodCartBuild: true,
+        });
+        if (refreshedAddresses.length) {
+          return {
+            kind: "address" as const,
+            message: buildAddressMessage(refreshedAddresses, "swiggy-food", {
+              title: "The saved Swiggy Food address is no longer available.",
+              detail:
+                "The previously saved Swiggy Food address could not be used anymore. Pick a current saved address and I’ll rebuild the food cart.",
+            }),
+          };
+        }
+      }
+      return {
+        kind: "blocked" as const,
+        message: createMessage(
+          "assistant",
+          `${foodCartResult.reason} I could not build the final food cart for ${restaurant.name}.`,
+          `food-cart-error-${recipe.id}-${Date.now()}`,
+        ),
+      };
+    }
+
+    return {
+      kind: "food-cart" as const,
+      message: buildFoodCartMessage({
+        recipe,
+        restaurantName: foodCartResult.restaurantName,
+        addressLine: foodCartResult.addressLine,
+        paymentMethods: foodCartResult.paymentMethods,
+        items: foodCartResult.items,
+        subtotal: foodCartResult.subtotal,
+        fees: foodCartResult.fees,
+        total: foodCartResult.total,
+      }),
+      resolvedAddress: selectedAddress,
+      cart: {
+        provider: "swiggy-food" as const,
+        restaurantId: foodCartResult.restaurantId,
+        restaurantName: foodCartResult.restaurantName,
+        addressId: foodCartResult.addressId,
+        addressLine: foodCartResult.addressLine,
+        paymentMethods: foodCartResult.paymentMethods,
+        items: foodCartResult.items,
+        subtotal: foodCartResult.subtotal,
+        fees: foodCartResult.fees,
+        total: foodCartResult.total,
+      },
+    };
+  }
+
   const addressResult = await grocery.listGroceryAddresses("swiggy-food", slug);
   if (addressResult.status === "auth_required") {
     return {
@@ -2403,6 +2911,108 @@ async function buildDineoutResultsState(
     return {
       kind: "provider" as const,
       message: buildDineoutConnectMessage(slug, query),
+    };
+  }
+
+  if (!selectedAddress) {
+    const lastUsedAddress = getLastUsedAddress(slug)?.address ?? null;
+    if (lastUsedAddress) {
+      return {
+        kind: "address" as const,
+        message: buildLastUsedAddressMessage(lastUsedAddress, "swiggy-dineout"),
+      };
+    }
+  }
+
+  const storedAddressId = getStoredProviderAddressId(selectedAddress, "swiggy-dineout");
+  if (storedAddressId && selectedAddress) {
+    const searchResults = await Promise.all([
+      grocery.searchProviderDineoutRestaurants(
+        "swiggy-dineout",
+        slug,
+        query,
+        storedAddressId,
+        null,
+        null,
+      ),
+    ]);
+
+    const authRequired = searchResults.find((entry) => entry.status === "auth_required");
+    if (authRequired && authRequired.status === "auth_required") {
+      return {
+        kind: "provider" as const,
+        message: buildAuthRecoveryMessage(
+          slug,
+          "swiggy-dineout",
+          authRequired.authReason,
+          "Swiggy Dineout needs to be reconnected before restaurant search.",
+        ),
+      };
+    }
+
+    const readyResults = searchResults.filter(
+      (entry): entry is Extract<typeof entry, { status: "ready" }> => entry.status === "ready",
+    );
+
+    if (!readyResults.length) {
+      const unavailableEntry = searchResults.find(
+        (entry) => entry.status === "unavailable" &&
+          looksLikeProviderAddressMismatch({
+            reason: entry.reason,
+            errorCode: entry.errorCode ?? null,
+          }),
+      );
+      if (unavailableEntry) {
+        const refreshedAddresses = await loadAddressOptionsForSession({
+          ...createInitialState(slug, "eat-out"),
+          slug,
+          selectedRecipe: buildSyntheticRecipe({
+            id: `dineout-${Date.now()}`,
+            name: query,
+            ingredients: [],
+            tags: ["dineout"],
+            note: "",
+          }),
+          eatOutMode: "dineout",
+        });
+        if (refreshedAddresses.length) {
+          return {
+            kind: "address" as const,
+            message: buildAddressMessage(refreshedAddresses, "swiggy-dineout", {
+              title: "The saved Dineout location is no longer available.",
+              detail:
+                "The previously saved Dineout location could not be used anymore. Pick a current saved location and I’ll search again.",
+            }),
+          };
+        }
+      }
+      return {
+        kind: "blocked" as const,
+        message: createMessage(
+          "assistant",
+          `I could not find bookable dine-out options for ${query} near that saved location.`,
+          `dineout-results-empty-${Date.now()}`,
+        ),
+      };
+    }
+
+    const restaurants = rerankDineoutRestaurantsForOccasion(
+      readyResults.flatMap((entry) => entry.restaurants),
+      occasion,
+      budget,
+    );
+
+    return {
+      kind: "dineout-restaurants" as const,
+      message: buildDineoutResultsMessage(
+        query,
+        restaurants,
+        occasion,
+        budget,
+        [selectedAddress.addressTag ?? selectedAddress.addressLine],
+      ),
+      restaurants,
+      resolvedAddress: selectedAddress,
     };
   }
 
@@ -2843,6 +3453,43 @@ async function listResolvedAddressesForSession(slug: string) {
   return resolveAddressOptions(readyGroups);
 }
 
+function wantsOtherAddresses(text: string) {
+  return /\b(other|another|different|wrong)\b/.test(text.toLowerCase()) &&
+    /\b(address|addresses|location|locations)\b/.test(text.toLowerCase());
+}
+
+async function loadAddressOptionsForSession(session: SessionState) {
+  if (session.eatOutMode === "dineout" && session.selectedRecipe?.tags.includes("dineout")) {
+    const grocery = await loadGroceryModule();
+    const addressResult = await grocery.listGroceryAddresses("swiggy-dineout", session.slug);
+    if (addressResult.status !== "ready") {
+      return [] as ResolvedAddress[];
+    }
+    return resolveAddressOptions([
+      {
+        provider: "swiggy-dineout",
+        addresses: addressResult.addresses,
+      },
+    ]);
+  }
+
+  if (session.pendingRestaurantFallback || session.pendingFoodCartBuild) {
+    const grocery = await loadGroceryModule();
+    const addressResult = await grocery.listGroceryAddresses("swiggy-food", session.slug);
+    if (addressResult.status !== "ready") {
+      return [] as ResolvedAddress[];
+    }
+    return resolveAddressOptions([
+      {
+        provider: "swiggy-food",
+        addresses: addressResult.addresses,
+      },
+    ]);
+  }
+
+  return listResolvedAddressesForSession(session.slug);
+}
+
 export function getOrCreateChatSession(slug: string): ChatSession {
   return getOrCreateChatSessionWithMode(slug, "free-text");
 }
@@ -3244,6 +3891,7 @@ export async function processChatMessage(
         );
         if ("resolvedAddress" in dineoutState && dineoutState.resolvedAddress) {
           session.selectedAddress = dineoutState.resolvedAddress;
+          rememberLastUsedAddress(session.slug, dineoutState.resolvedAddress);
         }
         session.messages.push(dineoutState.message);
         session.dineoutOptions =
@@ -3279,6 +3927,7 @@ export async function processChatMessage(
       );
       if ("resolvedAddress" in restaurantState && restaurantState.resolvedAddress) {
         session.selectedAddress = restaurantState.resolvedAddress;
+        rememberLastUsedAddress(session.slug, restaurantState.resolvedAddress);
       }
       session.messages.push(restaurantState.message);
       session.restaurantOptions =
@@ -3514,6 +4163,7 @@ export async function processChatMessage(
       );
       if ("resolvedAddress" in restaurantState && restaurantState.resolvedAddress) {
         session.selectedAddress = restaurantState.resolvedAddress;
+        rememberLastUsedAddress(session.slug, restaurantState.resolvedAddress);
       }
       session.messages.push(restaurantState.message);
       session.restaurantOptions =
@@ -3871,36 +4521,90 @@ export async function processChatMessage(
   }
 
   if (session.stage === "address-confirm") {
-    const availableAddresses =
-      session.eatOutMode === "dineout" && session.selectedRecipe?.tags.includes("dineout")
-      ? await (async () => {
-          const grocery = await loadGroceryModule();
-          const addressResult = await grocery.listGroceryAddresses("swiggy-dineout", session.slug);
-          if (addressResult.status !== "ready") {
-            return [] as ResolvedAddress[];
-          }
-          return resolveAddressOptions([
-            {
-              provider: "swiggy-dineout",
-              addresses: addressResult.addresses,
-            },
-          ]);
-        })()
-      : session.pendingRestaurantFallback || session.pendingFoodCartBuild
-      ? await (async () => {
-          const grocery = await loadGroceryModule();
-          const addressResult = await grocery.listGroceryAddresses("swiggy-food", session.slug);
-          if (addressResult.status !== "ready") {
-            return [] as ResolvedAddress[];
-          }
-          return resolveAddressOptions([
-            {
-              provider: "swiggy-food",
-              addresses: addressResult.addresses,
-            },
-          ]);
-        })()
-      : await listResolvedAddressesForSession(session.slug);
+    const lastAssistantMessage = [...session.messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    let availableAddresses: ResolvedAddress[] | null = null;
+
+    if (lastAssistantMessage?.type === "address-shortcut") {
+      if (wantsOtherAddresses(text)) {
+        availableAddresses = await loadAddressOptionsForSession(session);
+        if (!availableAddresses.length) {
+          session.messages.push(
+            createMessage(
+              "assistant",
+              "I could not load your saved addresses right now. Try again in a moment or reconnect the provider.",
+              nextMessageId(session),
+            ),
+          );
+          return finalizeSession(session);
+        }
+
+        session.messages.push(
+          buildAddressMessage(
+            availableAddresses,
+            lastAssistantMessage.provider ?? "swiggy-instamart",
+          ),
+        );
+        return finalizeSession(session);
+      }
+
+      const parsedShortcutTurn = await parseTurnIntent({
+        text,
+        stage: session.stage,
+        context: session.context,
+        discoveryMode: session.discoveryMode,
+        recipeOptions: session.recipeOptions,
+        addressOptions: [],
+      });
+
+      if (
+        parsedShortcutTurn.resolved.primaryIntent !== "choose_address" &&
+        !parsedShortcutTurn.resolved.affirmative
+      ) {
+        session.messages.push(
+          createMessage(
+            "assistant",
+            "Use the saved address to continue, or ask for the other saved addresses.",
+            nextMessageId(session),
+          ),
+        );
+        return finalizeSession(session);
+      }
+
+      const storedAddress = getLastUsedAddress(session.slug)?.address ?? null;
+      if (!storedAddress) {
+        availableAddresses = await loadAddressOptionsForSession(session);
+        if (!availableAddresses.length) {
+          session.messages.push(
+            createMessage(
+              "assistant",
+              "I could not retrieve the saved address right now. Ask for the other saved addresses or reconnect the provider.",
+              nextMessageId(session),
+            ),
+          );
+          return finalizeSession(session);
+        }
+
+        session.messages.push(
+          buildAddressMessage(
+            availableAddresses,
+            lastAssistantMessage.provider ?? "swiggy-instamart",
+          ),
+        );
+        return finalizeSession(session);
+      }
+
+      session.selectedAddress = storedAddress;
+      rememberLastUsedAddress(session.slug, storedAddress);
+      traceEvent("chat-engine", "address_selected", {
+        slug,
+        address: storedAddress.addressLine,
+        providers: Object.keys(storedAddress.providerIds),
+      });
+    }
+
+    availableAddresses = availableAddresses ?? (await loadAddressOptionsForSession(session));
     const parsedTurn = await parseTurnIntent({
       text,
       stage: session.stage,
@@ -3916,6 +4620,7 @@ export async function processChatMessage(
 
     if (chosenAddress) {
       session.selectedAddress = chosenAddress;
+      rememberLastUsedAddress(session.slug, chosenAddress);
       traceEvent("chat-engine", "address_selected", {
         slug,
         address: chosenAddress.addressLine,
@@ -3957,6 +4662,7 @@ export async function processChatMessage(
       );
       if ("resolvedAddress" in dineoutState && dineoutState.resolvedAddress) {
         session.selectedAddress = dineoutState.resolvedAddress;
+        rememberLastUsedAddress(session.slug, dineoutState.resolvedAddress);
       }
       session.messages.push(dineoutState.message);
       session.dineoutOptions =
@@ -4243,6 +4949,7 @@ export async function processChatMessage(
 
     if ("resolvedAddress" in foodCartState && foodCartState.resolvedAddress) {
       session.selectedAddress = foodCartState.resolvedAddress;
+      rememberLastUsedAddress(session.slug, foodCartState.resolvedAddress);
     }
 
     session.messages.push(foodCartState.message);
@@ -4652,6 +5359,7 @@ export async function completeGroceryConnectForSession(
 
     if ("resolvedAddress" in dineoutState && dineoutState.resolvedAddress) {
       session.selectedAddress = dineoutState.resolvedAddress;
+      rememberLastUsedAddress(session.slug, dineoutState.resolvedAddress);
     }
 
     session.messages.push(
@@ -4693,6 +5401,7 @@ export async function completeGroceryConnectForSession(
 
     if ("resolvedAddress" in restaurantState && restaurantState.resolvedAddress) {
       session.selectedAddress = restaurantState.resolvedAddress;
+      rememberLastUsedAddress(session.slug, restaurantState.resolvedAddress);
     }
 
     session.messages.push(
